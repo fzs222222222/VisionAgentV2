@@ -26,6 +26,30 @@ const typeTitle: Record<ProjectType, string> = {
   html: "HTML 动画视频项目",
 };
 
+function normalizeProjectTitle(value: string) {
+  return value.replace(/\s+/g, " ").trim().slice(0, 40);
+}
+
+export function buildProjectTitleFromPrompt(prompt: string, fallback?: string) {
+  const sanitized = prompt
+    .replace(/[“”"'`]/g, " ")
+    .replace(/[。！!？?,，、；;：:\n\r\t]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  const strippedPrefix = sanitized.replace(
+    /^(请|帮我|麻烦|我想|我想要|我要|需要|生成|做一个|制作|创作|写一个|给我一个|帮我生成|帮我制作)\s*/u,
+    "",
+  );
+
+  const directTitle = normalizeProjectTitle(strippedPrefix || sanitized);
+  if (directTitle) {
+    return directTitle;
+  }
+
+  return normalizeProjectTitle(fallback ?? "");
+}
+
 function mapProject(row: ProjectRow): Project {
   return {
     uuid: row.uuid,
@@ -110,12 +134,18 @@ export async function deleteProject(uuid: string) {
 
 export async function updateProject(input: {
   uuid: string;
+  title?: string;
   type?: ProjectType;
   outlineContent?: string;
   videoSource?: string;
 }) {
   const fields: string[] = [];
   const params: Record<string, string> = { uuid: input.uuid };
+
+  if (input.title !== undefined) {
+    fields.push("title = :title");
+    params.title = input.title;
+  }
 
   if (input.type !== undefined) {
     fields.push("type = :type");
