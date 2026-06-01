@@ -1,3 +1,11 @@
 node_modules
 .next
 .env
+
+# Runtime-generated media artifacts
+public/generated-images/*
+public/generated-audio/*
+public/generated-videos/*
+!public/generated-images/.gitkeep
+!public/generated-audio/.gitkeep
+!public/generated-videos/.gitkeep
