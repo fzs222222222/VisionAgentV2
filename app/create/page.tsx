@@ -13,6 +13,7 @@ import {
   Loader2,
   MessageSquareText,
   Music,
+  Pause,
   PanelLeft,
   Play,
   Plus,
@@ -24,6 +25,7 @@ import {
   Volume2,
   X,
 } from "lucide-react";
+import { getSceneAudioMap, getSceneImageMap } from "@/app/lib/videoSource";
 
 type ModeKey = "slideshow" | "html";
 type ChatRole = "user" | "assistant";
@@ -41,6 +43,7 @@ type VideoOutline = {
   fullScript: string;
   mode: ModeKey;
   promptKind: "image" | "html";
+  globalVisualStylePrompt?: string;
   scenes: SceneOutline[];
 };
 
@@ -49,7 +52,31 @@ type Project = {
   title: string;
   type: ModeKey;
   outlineContent: string;
+  videoSource: string;
   createdAt: string;
+};
+
+type SceneAudio = {
+  sceneNumber: number;
+  title: string;
+  narration: string;
+  voice: string;
+  filename: string;
+  relativePath: string;
+  publicUrl: string;
+  durationMs?: number;
+  createdAt: string;
+};
+
+type SubtitleSegment = {
+  text: string;
+  startRatio: number;
+  endRatio: number;
+};
+
+type ExportFormat = {
+  extension: "mp4" | "webm";
+  mimeType: string;
 };
 
 type AssistantPayload = {
@@ -116,9 +143,169 @@ function shortenNarration(value: string, maxLength = 42) {
   return `${value.slice(0, maxLength)}...`;
 }
 
+function normalizeSubtitleSentence(value: string) {
+  return value.replace(/[，。！？；：,.!?;:\s]+$/g, "").trim();
+}
+
+function splitNarrationIntoSubtitles(narration: string) {
+  const parts = narration
+    .split(/[，。！？；：,.!?;\n\r]+/g)
+    .map(normalizeSubtitleSentence)
+    .filter(Boolean);
+
+  if (!parts.length) {
+    return [] as SubtitleSegment[];
+  }
+
+  const totalCharacters = parts.reduce((sum, part) => sum + part.length, 0) || parts.length;
+  let accumulatedRatio = 0;
+
+  return parts.map((part, index) => {
+    const ratio = part.length / totalCharacters;
+    const startRatio = accumulatedRatio;
+    const endRatio = index === parts.length - 1 ? 1 : Math.min(accumulatedRatio + ratio, 1);
+    accumulatedRatio = endRatio;
+
+    return {
+      text: part,
+      startRatio,
+      endRatio,
+    };
+  });
+}
+
+function formatDuration(ms: number) {
+  const totalSeconds = Math.max(0, Math.floor(ms / 1000));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+}
+
+function pickExportFormat() {
+  if (typeof window === "undefined" || typeof MediaRecorder === "undefined") {
+    return null;
+  }
+
+  const candidates: ExportFormat[] = [
+    { extension: "mp4", mimeType: 'video/mp4;codecs="avc1.42E01E,mp4a.40.2"' },
+    { extension: "webm", mimeType: 'video/webm;codecs="vp9,opus"' },
+    { extension: "webm", mimeType: 'video/webm;codecs="vp8,opus"' },
+    { extension: "webm", mimeType: "video/webm" },
+  ];
+
+  return candidates.find((item) => MediaRecorder.isTypeSupported(item.mimeType)) ?? null;
+}
+
+function loadImage(url: string) {
+  return new Promise<HTMLImageElement>((resolve, reject) => {
+    const image = new Image();
+    image.decoding = "async";
+    image.onload = () => resolve(image);
+    image.onerror = () => reject(new Error(`图片加载失败: ${url}`));
+    image.src = url;
+  });
+}
+
+function drawImageCover(context: CanvasRenderingContext2D, image: HTMLImageElement, width: number, height: number, zoom = 1) {
+  const imageRatio = image.width / image.height;
+  const canvasRatio = width / height;
+
+  let drawWidth = width;
+  let drawHeight = height;
+
+  if (imageRatio > canvasRatio) {
+    drawHeight = height;
+    drawWidth = height * imageRatio;
+  } else {
+    drawWidth = width;
+    drawHeight = width / imageRatio;
+  }
+
+  drawWidth *= zoom;
+  drawHeight *= zoom;
+
+  const offsetX = (width - drawWidth) / 2;
+  const offsetY = (height - drawHeight) / 2;
+  context.drawImage(image, offsetX, offsetY, drawWidth, drawHeight);
+}
+
+function drawSubtitleCard(context: CanvasRenderingContext2D, text: string, width: number, height: number) {
+  if (!text) {
+    return;
+  }
+
+  const maxTextWidth = Math.min(width * 0.8, 920);
+  const fontSize = Math.max(28, Math.min(46, Math.round(width / 28)));
+  context.font = `800 ${fontSize}px "Microsoft YaHei", "PingFang SC", sans-serif`;
+
+  const words = Array.from(text);
+  const lines: string[] = [];
+  let currentLine = "";
+
+  words.forEach((character) => {
+    const nextLine = currentLine + character;
+    if (context.measureText(nextLine).width > maxTextWidth && currentLine) {
+      lines.push(currentLine);
+      currentLine = character;
+      return;
+    }
+    currentLine = nextLine;
+  });
+
+  if (currentLine) {
+    lines.push(currentLine);
+  }
+
+  const lineHeight = Math.round(fontSize * 1.38);
+  const cardHeight = lines.length * lineHeight + 28;
+  const boxY = height - 170 - cardHeight;
+  const boxWidth = Math.min(
+    maxTextWidth + 64,
+    Math.max(...lines.map((line) => context.measureText(line).width), 0) + 64,
+  );
+  const boxX = (width - boxWidth) / 2;
+
+  context.save();
+  context.fillStyle = "rgba(20, 29, 45, 0.55)";
+  context.beginPath();
+  context.roundRect(boxX, boxY, boxWidth, cardHeight, 20);
+  context.fill();
+  context.shadowColor = "rgba(0, 0, 0, 0.72)";
+  context.shadowBlur = 18;
+  context.fillStyle = "#ffffff";
+  context.textAlign = "center";
+  context.textBaseline = "middle";
+
+  lines.forEach((line, index) => {
+    const y = boxY + 14 + lineHeight / 2 + index * lineHeight;
+    context.fillText(line, width / 2, y);
+  });
+  context.restore();
+}
+
+const DEFAULT_SCENE_DURATION_MS = 3000;
+
+function estimateNarrationDurationMs(narration: string) {
+  const trimmed = narration.trim();
+  if (!trimmed) {
+    return DEFAULT_SCENE_DURATION_MS;
+  }
+
+  const compactText = trimmed.replace(/\s+/g, "");
+  const pauseCount = (trimmed.match(/[，。！？；：,.!?;:]/g) ?? []).length;
+  const estimatedMs = Math.round((compactText.length / 4.2) * 1000 + pauseCount * 180);
+  return Math.max(2500, estimatedMs);
+}
+
 export default function CreatePage() {
   const shellRef = useRef<HTMLElement | null>(null);
   const chatEndRef = useRef<HTMLDivElement | null>(null);
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const previewAudioRef = useRef<HTMLAudioElement | null>(null);
+  const playbackSceneRef = useRef<number | null>(null);
+  const playbackSceneTimeoutRef = useRef<number | null>(null);
+  const sceneGenerationAbortRef = useRef<AbortController | null>(null);
+  const stopSceneGenerationRef = useRef(false);
   const [selectedMode, setSelectedMode] = useState<ModeKey>("slideshow");
   const [activeScene, setActiveScene] = useState(0);
   const [projects, setProjects] = useState<Project[]>([]);
@@ -133,6 +320,17 @@ export default function CreatePage() {
   const [isDeleteSelecting, setIsDeleteSelecting] = useState(false);
   const [chatPanelWidth, setChatPanelWidth] = useState(380);
   const [isOutlineModalOpen, setIsOutlineModalOpen] = useState(false);
+  const [isGeneratingSceneImages, setIsGeneratingSceneImages] = useState(false);
+  const [generatingSceneNumber, setGeneratingSceneNumber] = useState<number | null>(null);
+  const [sceneGenerationError, setSceneGenerationError] = useState("");
+  const [playingSceneNumber, setPlayingSceneNumber] = useState<number | null>(null);
+  const [isPreviewPlaying, setIsPreviewPlaying] = useState(false);
+  const [currentPlaybackMs, setCurrentPlaybackMs] = useState(0);
+  const [sceneDurationMap, setSceneDurationMap] = useState<Record<number, number>>({});
+  const [sceneActionLoadingMap, setSceneActionLoadingMap] = useState<Record<string, boolean>>({});
+  const [isExportingVideo, setIsExportingVideo] = useState(false);
+  const [exportProgress, setExportProgress] = useState(0);
+  const [exportMessage, setExportMessage] = useState("");
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
@@ -203,6 +401,32 @@ export default function CreatePage() {
     chatEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
   }, [messages, isSending]);
 
+  useEffect(() => {
+    return () => {
+      stopSceneGenerationRef.current = true;
+      sceneGenerationAbortRef.current?.abort();
+      if (playbackSceneTimeoutRef.current !== null) {
+        window.clearTimeout(playbackSceneTimeoutRef.current);
+      }
+      previewAudioRef.current?.pause();
+    };
+  }, []);
+
+  useEffect(() => {
+    stopSceneGenerationRef.current = true;
+    sceneGenerationAbortRef.current?.abort();
+    setIsGeneratingSceneImages(false);
+    setGeneratingSceneNumber(null);
+    setSceneGenerationError("");
+    setIsPreviewPlaying(false);
+    setCurrentPlaybackMs(0);
+    setSceneActionLoadingMap({});
+    setIsExportingVideo(false);
+    setExportProgress(0);
+    setExportMessage("");
+    previewAudioRef.current?.pause();
+  }, [activeProjectId]);
+
   const currentProject = useMemo(
     () => projects.find((project) => project.uuid === activeProjectId) ?? null,
     [activeProjectId, projects],
@@ -214,7 +438,77 @@ export default function CreatePage() {
   );
 
   const visibleScenes = currentOutline?.scenes ?? [];
-  const activeOutlineScene = visibleScenes[activeScene] ?? null;
+  const sceneImageMap = useMemo(() => getSceneImageMap(currentProject?.videoSource ?? ""), [currentProject?.videoSource]);
+  const sceneAudioMap = useMemo(() => getSceneAudioMap(currentProject?.videoSource ?? ""), [currentProject?.videoSource]);
+  const sceneTimeline = useMemo(
+    () =>
+      visibleScenes.map((scene, index) => {
+        const durationMs =
+          sceneAudioMap[scene.sceneNumber]?.durationMs ??
+          sceneDurationMap[scene.sceneNumber] ??
+          estimateNarrationDurationMs(scene.narration);
+        const startMs =
+          index === 0
+            ? 0
+            : visibleScenes
+                .slice(0, index)
+                .reduce(
+                  (sum, previousScene) =>
+                    sum +
+                    (sceneAudioMap[previousScene.sceneNumber]?.durationMs ??
+                      sceneDurationMap[previousScene.sceneNumber] ??
+                      estimateNarrationDurationMs(previousScene.narration)),
+                  0,
+                );
+
+        return {
+          sceneNumber: scene.sceneNumber,
+          startMs,
+          endMs: startMs + durationMs,
+          durationMs,
+        };
+      }),
+    [sceneAudioMap, sceneDurationMap, visibleScenes],
+  );
+  const totalPlaybackDurationMs = useMemo(
+    () => sceneTimeline[sceneTimeline.length - 1]?.endMs ?? 0,
+    [sceneTimeline],
+  );
+  const displaySceneIndex = activeScene;
+  const activeOutlineScene = visibleScenes[displaySceneIndex] ?? null;
+  const activeSceneImage = activeOutlineScene ? sceneImageMap[activeOutlineScene.sceneNumber] ?? null : null;
+  const activeSceneAudio = activeOutlineScene ? sceneAudioMap[activeOutlineScene.sceneNumber] ?? null : null;
+  const canGenerateSceneImages = currentOutline?.promptKind === "image" && visibleScenes.length > 0;
+  const generatedSceneCount = useMemo(
+    () => visibleScenes.filter((scene) => Boolean(sceneImageMap[scene.sceneNumber] && sceneAudioMap[scene.sceneNumber])).length,
+    [sceneAudioMap, sceneImageMap, visibleScenes],
+  );
+  const activePlaybackSegment = sceneTimeline[displaySceneIndex] ?? null;
+  const activeScenePlaybackProgress =
+    isPreviewPlaying && activePlaybackSegment
+      ? Math.min(
+          Math.max((currentPlaybackMs - activePlaybackSegment.startMs) / Math.max(activePlaybackSegment.durationMs, 1), 0),
+          1,
+        )
+      : 0;
+  const playbackProgressPercent = totalPlaybackDurationMs > 0 ? Math.min((currentPlaybackMs / totalPlaybackDurationMs) * 100, 100) : 0;
+  const activeSubtitleSegments = useMemo(
+    () => (activeOutlineScene ? splitNarrationIntoSubtitles(activeOutlineScene.narration) : []),
+    [activeOutlineScene],
+  );
+  const activeSubtitleText = useMemo(() => {
+    if (!activeSubtitleSegments.length) {
+      return "";
+    }
+
+    const matchedSegment =
+      activeSubtitleSegments.find(
+        (segment) => activeScenePlaybackProgress >= segment.startRatio && activeScenePlaybackProgress < segment.endRatio,
+      ) ?? activeSubtitleSegments[activeSubtitleSegments.length - 1];
+
+    return matchedSegment?.text ?? "";
+  }, [activeScenePlaybackProgress, activeSubtitleSegments]);
+  const displaySubtitleText = activeSubtitleText || activeSubtitleSegments[0]?.text || "";
 
   useEffect(() => {
     if (currentProject?.type) {
@@ -228,6 +522,179 @@ export default function CreatePage() {
     }
   }, [activeScene, visibleScenes.length]);
 
+  useEffect(() => {
+    if (!visibleScenes.length) {
+      setSceneDurationMap({});
+      return;
+    }
+
+    let ignore = false;
+    const nextDurations: Record<number, number> = {};
+    const tasks = visibleScenes.map((scene) => {
+      const storedDuration = sceneAudioMap[scene.sceneNumber]?.durationMs;
+      if (typeof storedDuration === "number" && storedDuration > 0) {
+        nextDurations[scene.sceneNumber] = storedDuration;
+        return Promise.resolve();
+      }
+
+      const sceneAudio = sceneAudioMap[scene.sceneNumber];
+      if (!sceneAudio?.publicUrl) {
+        nextDurations[scene.sceneNumber] = estimateNarrationDurationMs(scene.narration);
+        return Promise.resolve();
+      }
+
+      return new Promise<void>((resolve) => {
+        const probe = new Audio();
+        probe.preload = "metadata";
+        probe.src = sceneAudio.publicUrl;
+
+        const finalize = (durationMs: number) => {
+          nextDurations[scene.sceneNumber] = durationMs;
+          probe.src = "";
+          resolve();
+        };
+
+        probe.onloadedmetadata = () => {
+          const durationMs =
+            Number.isFinite(probe.duration) && probe.duration > 0
+              ? Math.round(probe.duration * 1000)
+              : estimateNarrationDurationMs(scene.narration);
+          finalize(durationMs);
+        };
+        probe.onerror = () => finalize(estimateNarrationDurationMs(scene.narration));
+      });
+    });
+
+    void Promise.all(tasks).then(() => {
+      if (!ignore) {
+        setSceneDurationMap(nextDurations);
+      }
+    });
+
+    return () => {
+      ignore = true;
+    };
+  }, [sceneAudioMap, visibleScenes]);
+
+  useEffect(() => {
+    const audio = audioRef.current;
+    if (!audio) return;
+
+    const handleEnded = () => setPlayingSceneNumber(null);
+    const handlePause = () => {
+      if (!audio.ended) {
+        setPlayingSceneNumber(null);
+      }
+    };
+
+    audio.addEventListener("ended", handleEnded);
+    audio.addEventListener("pause", handlePause);
+
+    return () => {
+      audio.removeEventListener("ended", handleEnded);
+      audio.removeEventListener("pause", handlePause);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (playingSceneNumber !== null && !sceneAudioMap[playingSceneNumber]) {
+      audioRef.current?.pause();
+      setPlayingSceneNumber(null);
+    }
+  }, [playingSceneNumber, sceneAudioMap]);
+
+  useEffect(() => {
+    if (!isPreviewPlaying || !activeOutlineScene) {
+      if (playbackSceneTimeoutRef.current !== null) {
+        window.clearTimeout(playbackSceneTimeoutRef.current);
+        playbackSceneTimeoutRef.current = null;
+      }
+      previewAudioRef.current?.pause();
+      playbackSceneRef.current = null;
+      return;
+    }
+
+    if (playbackSceneRef.current === activeOutlineScene.sceneNumber) {
+      return;
+    }
+
+    playbackSceneRef.current = activeOutlineScene.sceneNumber;
+    const previewAudio = previewAudioRef.current;
+    const sceneAudio = sceneAudioMap[activeOutlineScene.sceneNumber];
+    const activeSegment = sceneTimeline[activeScene];
+
+    if (!activeSegment) {
+      stopPreviewPlayback();
+      return;
+    }
+
+    if (playbackSceneTimeoutRef.current !== null) {
+      window.clearTimeout(playbackSceneTimeoutRef.current);
+      playbackSceneTimeoutRef.current = null;
+    }
+
+    setCurrentPlaybackMs(activeSegment.startMs);
+
+    const advanceToNextScene = () => {
+      if (playbackSceneTimeoutRef.current !== null) {
+        window.clearTimeout(playbackSceneTimeoutRef.current);
+        playbackSceneTimeoutRef.current = null;
+      }
+
+      const nextSceneIndex = activeScene + 1;
+      if (nextSceneIndex < visibleScenes.length) {
+        setActiveScene(nextSceneIndex);
+        return;
+      }
+
+      stopPreviewPlayback();
+      setCurrentPlaybackMs(totalPlaybackDurationMs);
+      setActiveScene(Math.max(visibleScenes.length - 1, 0));
+    };
+
+    if (!previewAudio || !sceneAudio?.publicUrl) {
+      if (previewAudio) {
+        previewAudio.pause();
+        previewAudio.removeAttribute("src");
+        previewAudio.load();
+      }
+      playbackSceneTimeoutRef.current = window.setTimeout(() => {
+        setCurrentPlaybackMs(activeSegment.endMs);
+        advanceToNextScene();
+      }, activeSegment.durationMs);
+      return;
+    }
+
+    previewAudio.pause();
+    previewAudio.src = sceneAudio.publicUrl;
+    previewAudio.currentTime = 0;
+    previewAudio.onloadedmetadata = () => {
+      const actualDurationMs =
+        Number.isFinite(previewAudio.duration) && previewAudio.duration > 0
+          ? Math.round(previewAudio.duration * 1000)
+          : estimateNarrationDurationMs(activeOutlineScene.narration);
+      setSceneDurationMap((current) => ({
+        ...current,
+        [activeOutlineScene.sceneNumber]: Math.max(current[activeOutlineScene.sceneNumber] ?? 0, actualDurationMs),
+      }));
+    };
+    previewAudio.ontimeupdate = () => {
+      setCurrentPlaybackMs(Math.min(activeSegment.startMs + previewAudio.currentTime * 1000, totalPlaybackDurationMs));
+    };
+    previewAudio.onended = () => {
+      setCurrentPlaybackMs(activeSegment.endMs);
+      advanceToNextScene();
+    };
+    previewAudio.onerror = () => {
+      setCurrentPlaybackMs(activeSegment.endMs);
+      advanceToNextScene();
+    };
+    void previewAudio.play().catch((error) => {
+      console.error("播放视频分镜音频失败", error);
+      stopPreviewPlayback();
+    });
+  }, [activeOutlineScene, activeScene, isPreviewPlaying, sceneAudioMap, sceneTimeline, totalPlaybackDurationMs, visibleScenes.length]);
+
   function syncProject(nextProject: Project) {
     setProjects((current) => {
       const exists = current.some((item) => item.uuid === nextProject.uuid);
@@ -238,6 +705,7 @@ export default function CreatePage() {
   }
 
   function selectProject(project: Project) {
+    stopPreviewPlayback(true);
     setActiveProjectId(project.uuid);
     setSelectedMode(project.type);
     setActiveScene(0);
@@ -246,6 +714,7 @@ export default function CreatePage() {
   }
 
   function handleModeChange(mode: ModeKey) {
+    stopPreviewPlayback(true);
     setSelectedMode(mode);
     if (!activeProjectId) {
       window.history.replaceState(null, "", `/create?mode=${mode}`);
@@ -275,6 +744,431 @@ export default function CreatePage() {
 
     window.addEventListener("mousemove", onMouseMove);
     window.addEventListener("mouseup", onMouseUp);
+  }
+
+  function handleStopSceneGeneration() {
+    stopSceneGenerationRef.current = true;
+    sceneGenerationAbortRef.current?.abort();
+  }
+
+  function stopPreviewPlayback(resetToStart = false) {
+    if (playbackSceneTimeoutRef.current !== null) {
+      window.clearTimeout(playbackSceneTimeoutRef.current);
+      playbackSceneTimeoutRef.current = null;
+    }
+
+    if (previewAudioRef.current) {
+      previewAudioRef.current.pause();
+      previewAudioRef.current.onloadedmetadata = null;
+      previewAudioRef.current.ontimeupdate = null;
+      previewAudioRef.current.onended = null;
+      previewAudioRef.current.onerror = null;
+      previewAudioRef.current.removeAttribute("src");
+      previewAudioRef.current.load();
+    }
+    playbackSceneRef.current = null;
+    setIsPreviewPlaying(false);
+
+    if (resetToStart) {
+      setCurrentPlaybackMs(0);
+      setActiveScene(0);
+    }
+  }
+
+  function startPreviewPlayback() {
+    if (!visibleScenes.length || totalPlaybackDurationMs <= 0) {
+      return;
+    }
+
+    audioRef.current?.pause();
+    setPlayingSceneNumber(null);
+    setCurrentPlaybackMs(0);
+    setActiveScene(0);
+    playbackSceneRef.current = null;
+    setIsPreviewPlaying(true);
+  }
+
+  function handleTogglePreviewPlayback() {
+    if (isPreviewPlaying) {
+      stopPreviewPlayback();
+      return;
+    }
+
+    startPreviewPlayback();
+  }
+
+  async function handlePlaySceneAudio(audio: SceneAudio, event: React.MouseEvent<HTMLButtonElement>) {
+    event.stopPropagation();
+    stopPreviewPlayback();
+
+    const player = audioRef.current;
+    if (!player) return;
+
+    if (playingSceneNumber === audio.sceneNumber && !player.paused) {
+      player.pause();
+      setPlayingSceneNumber(null);
+      return;
+    }
+
+    player.src = audio.publicUrl;
+
+    try {
+      await player.play();
+      setPlayingSceneNumber(audio.sceneNumber);
+    } catch (error) {
+      console.error("播放分镜音频失败", error);
+      setPlayingSceneNumber(null);
+    }
+  }
+
+  function setSceneActionLoading(actionKey: string, loading: boolean) {
+    setSceneActionLoadingMap((current) => {
+      if (loading) {
+        return {
+          ...current,
+          [actionKey]: true,
+        };
+      }
+
+      const next = { ...current };
+      delete next[actionKey];
+      return next;
+    });
+  }
+
+  async function requestSceneMediaGeneration(
+    sceneNumber: number,
+    options?: {
+      regenerateImage?: boolean;
+      regenerateAudio?: boolean;
+      actionKey?: string;
+    },
+  ) {
+    if (!activeProjectId) {
+      return;
+    }
+
+    const actionKey = options?.actionKey;
+    if (actionKey) {
+      setSceneActionLoading(actionKey, true);
+    }
+
+    try {
+      const response = await fetch(`/api/projects/${encodeURIComponent(activeProjectId)}/scene-images`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          sceneNumber,
+          regenerateImage: options?.regenerateImage ?? false,
+          regenerateAudio: options?.regenerateAudio ?? false,
+        }),
+      });
+
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(data.details ?? data.error ?? "生成分镜资源失败");
+      }
+
+      if (data.project?.uuid) {
+        syncProject(data.project);
+      }
+    } finally {
+      if (actionKey) {
+        setSceneActionLoading(actionKey, false);
+      }
+    }
+  }
+
+  async function handleGenerateSceneImages() {
+    if (!activeProjectId || !canGenerateSceneImages || isGeneratingSceneImages) return;
+
+    const completedScenes = new Set(
+      visibleScenes
+        .filter((scene) => Boolean(sceneImageMap[scene.sceneNumber] && sceneAudioMap[scene.sceneNumber]))
+        .map((scene) => scene.sceneNumber),
+    );
+    stopSceneGenerationRef.current = false;
+    setSceneGenerationError("");
+    setIsGeneratingSceneImages(true);
+
+    try {
+      for (const scene of visibleScenes) {
+        if (stopSceneGenerationRef.current) break;
+        if (completedScenes.has(scene.sceneNumber)) continue;
+
+        setGeneratingSceneNumber(scene.sceneNumber);
+        const controller = new AbortController();
+        sceneGenerationAbortRef.current = controller;
+
+        try {
+          const response = await fetch(`/api/projects/${encodeURIComponent(activeProjectId)}/scene-images`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ sceneNumber: scene.sceneNumber }),
+            signal: controller.signal,
+          });
+
+          const data = await response.json().catch(() => ({}));
+
+          if (response.status === 499 || data.aborted || stopSceneGenerationRef.current) {
+            break;
+          }
+
+          if (!response.ok) {
+            throw new Error(data.details ?? data.error ?? "生成分镜图片失败");
+          }
+
+          if (data.project?.uuid) {
+            syncProject(data.project);
+          }
+
+          completedScenes.add(scene.sceneNumber);
+        } finally {
+          sceneGenerationAbortRef.current = null;
+          setGeneratingSceneNumber(null);
+        }
+      }
+    } catch (error) {
+      if (error instanceof DOMException && error.name === "AbortError" && stopSceneGenerationRef.current) {
+        return;
+      }
+
+      const message = error instanceof Error ? error.message : "生成分镜图片失败";
+      setSceneGenerationError(message);
+    } finally {
+      setIsGeneratingSceneImages(false);
+      setGeneratingSceneNumber(null);
+      sceneGenerationAbortRef.current = null;
+      stopSceneGenerationRef.current = false;
+    }
+  }
+
+  async function handleRegenerateSceneImage(sceneNumber: number, event: React.MouseEvent<HTMLButtonElement>) {
+    event.stopPropagation();
+    setSceneGenerationError("");
+
+    try {
+      await requestSceneMediaGeneration(sceneNumber, {
+        regenerateImage: true,
+        actionKey: `image-${sceneNumber}`,
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "重新生成画面失败";
+      setSceneGenerationError(message);
+    }
+  }
+
+  async function handleRegenerateSceneAudio(sceneNumber: number, event: React.MouseEvent<HTMLButtonElement>) {
+    event.stopPropagation();
+    setSceneGenerationError("");
+
+    try {
+      await requestSceneMediaGeneration(sceneNumber, {
+        regenerateAudio: true,
+        actionKey: `audio-${sceneNumber}`,
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "重新生成旁白失败";
+      setSceneGenerationError(message);
+    }
+  }
+
+  async function handleExportVideo() {
+    if (!activeProjectId || !currentOutline || currentOutline.promptKind !== "image" || !visibleScenes.length || isExportingVideo) {
+      return;
+    }
+
+    const exportFormat = pickExportFormat();
+    if (!exportFormat) {
+      setExportMessage("当前浏览器不支持视频导出格式");
+      return;
+    }
+
+    const exportScenes = visibleScenes.map((scene, index) => {
+      const sceneImage = sceneImageMap[scene.sceneNumber];
+      const segment = sceneTimeline[index];
+      return {
+        scene,
+        image: sceneImage,
+        audio: sceneAudioMap[scene.sceneNumber] ?? null,
+        segment,
+        subtitles: splitNarrationIntoSubtitles(scene.narration),
+      };
+    });
+
+    if (exportScenes.some((item) => !item.image || !item.segment)) {
+      setExportMessage("请先为所有分镜生成图片后再导出");
+      return;
+    }
+
+    stopPreviewPlayback();
+    audioRef.current?.pause();
+    setPlayingSceneNumber(null);
+    setExportMessage("");
+    setExportProgress(0);
+    setIsExportingVideo(true);
+
+    const canvas = document.createElement("canvas");
+    const width = 1280;
+    const height = 720;
+    canvas.width = width;
+    canvas.height = height;
+    const context = canvas.getContext("2d");
+
+    if (!context) {
+      setIsExportingVideo(false);
+      setExportMessage("导出画布初始化失败");
+      return;
+    }
+
+    const audioContext = new AudioContext();
+    const destination = audioContext.createMediaStreamDestination();
+    const fps = 30;
+    const stream = canvas.captureStream(fps);
+    destination.stream.getAudioTracks().forEach((track) => stream.addTrack(track));
+
+    let animationFrameId = 0;
+    let recorderStopTimer = 0;
+    let startedAt = 0;
+
+    try {
+      const [loadedImages, decodedAudios] = await Promise.all([
+        Promise.all(exportScenes.map(async (item) => [item.scene.sceneNumber, await loadImage(item.image!.publicUrl)] as const)),
+        Promise.all(
+          exportScenes.map(async (item) => {
+            if (!item.audio?.publicUrl) {
+              return [item.scene.sceneNumber, null] as const;
+            }
+
+            const response = await fetch(item.audio.publicUrl);
+            if (!response.ok) {
+              throw new Error(`分镜 ${item.scene.sceneNumber} 音频加载失败`);
+            }
+
+            const bytes = await response.arrayBuffer();
+            const buffer = await audioContext.decodeAudioData(bytes.slice(0));
+            return [item.scene.sceneNumber, buffer] as const;
+          }),
+        ),
+      ]);
+
+      const imageMap = Object.fromEntries(loadedImages) as Record<number, HTMLImageElement>;
+      const audioBufferMap = Object.fromEntries(decodedAudios) as Record<number, AudioBuffer | null>;
+      const recorderChunks: BlobPart[] = [];
+      const recorder = new MediaRecorder(stream, {
+        mimeType: exportFormat.mimeType,
+        videoBitsPerSecond: 6_000_000,
+      });
+
+      recorder.ondataavailable = (event) => {
+        if (event.data.size > 0) {
+          recorderChunks.push(event.data);
+        }
+      };
+
+      const recorderStopped = new Promise<Blob>((resolve) => {
+        recorder.onstop = () => {
+          resolve(new Blob(recorderChunks, { type: exportFormat.mimeType }));
+        };
+      });
+
+      await audioContext.resume();
+      startedAt = performance.now();
+
+      exportScenes.forEach((item) => {
+        const buffer = audioBufferMap[item.scene.sceneNumber];
+        if (!buffer || !item.segment) {
+          return;
+        }
+
+        const source = audioContext.createBufferSource();
+        const gainNode = audioContext.createGain();
+        source.buffer = buffer;
+        source.connect(gainNode);
+        gainNode.connect(destination);
+        source.start(audioContext.currentTime + item.segment.startMs / 1000);
+      });
+
+      const renderFrame = () => {
+        const elapsed = Math.min(performance.now() - startedAt, totalPlaybackDurationMs);
+        const activeIndex =
+          exportScenes.findIndex((item) => item.segment && elapsed >= item.segment.startMs && elapsed < item.segment.endMs) >= 0
+            ? exportScenes.findIndex((item) => item.segment && elapsed >= item.segment.startMs && elapsed < item.segment.endMs)
+            : Math.max(exportScenes.length - 1, 0);
+        const activeItem = exportScenes[activeIndex];
+        const activeSegment = activeItem?.segment;
+        const activeImage = imageMap[activeItem.scene.sceneNumber];
+
+        context.clearRect(0, 0, width, height);
+        if (activeImage) {
+          drawImageCover(context, activeImage, width, height, 1.015);
+        } else {
+          context.fillStyle = "#0d1426";
+          context.fillRect(0, 0, width, height);
+        }
+
+        context.fillStyle = "rgba(9, 20, 46, 0.24)";
+        context.fillRect(0, 0, width, height);
+        context.fillStyle = "rgba(9, 20, 46, 0.28)";
+        context.fillRect(0, height - 130, width, 130);
+
+        const sceneProgress = activeSegment ? Math.min(Math.max((elapsed - activeSegment.startMs) / Math.max(activeSegment.durationMs, 1), 0), 1) : 0;
+        const subtitle =
+          activeItem.subtitles.find((segment) => sceneProgress >= segment.startRatio && sceneProgress < segment.endRatio)?.text ??
+          activeItem.subtitles[activeItem.subtitles.length - 1]?.text ??
+          "";
+        drawSubtitleCard(context, subtitle, width, height);
+
+        setExportProgress(totalPlaybackDurationMs > 0 ? elapsed / totalPlaybackDurationMs : 0);
+
+        if (elapsed < totalPlaybackDurationMs) {
+          animationFrameId = requestAnimationFrame(renderFrame);
+        }
+      };
+
+      renderFrame();
+      recorder.start(250);
+
+      recorderStopTimer = window.setTimeout(() => {
+        if (recorder.state !== "inactive") {
+          recorder.stop();
+        }
+      }, totalPlaybackDurationMs + 220);
+
+      const blob = await recorderStopped;
+      cancelAnimationFrame(animationFrameId);
+      window.clearTimeout(recorderStopTimer);
+
+      const formData = new FormData();
+      formData.append("file", new File([blob], `${activeProjectId}.${exportFormat.extension}`, { type: exportFormat.mimeType }));
+
+      const response = await fetch(`/api/projects/${encodeURIComponent(activeProjectId)}/export-video`, {
+        method: "POST",
+        body: formData,
+      });
+      const data = await response.json().catch(() => ({}));
+
+      if (!response.ok || !data.publicUrl) {
+        throw new Error(data.error ?? "视频保存失败");
+      }
+
+      const link = document.createElement("a");
+      link.href = data.publicUrl;
+      link.download = data.filename ?? `${activeProjectId}.${exportFormat.extension}`;
+      link.click();
+
+      setExportProgress(1);
+      setExportMessage(`导出成功，已保存到 /public/${data.relativePath}`);
+    } catch (error) {
+      cancelAnimationFrame(animationFrameId);
+      window.clearTimeout(recorderStopTimer);
+      const message = error instanceof Error ? error.message : "导出视频失败";
+      setExportMessage(message);
+    } finally {
+      stream.getTracks().forEach((track) => track.stop());
+      void audioContext.close().catch(() => undefined);
+      setIsExportingVideo(false);
+    }
   }
 
   async function handleCreateProject() {
@@ -495,31 +1389,45 @@ export default function CreatePage() {
               <button type="button">
                 <Download size={17} /> 导出视频
               </button>
+              <button className="export-video-button" disabled={isExportingVideo || selectedMode !== "slideshow"} onClick={() => void handleExportVideo()} type="button">
+                {isExportingVideo ? <Loader2 size={17} /> : <Download size={17} />} {isExportingVideo ? "导出中" : "导出视频"}
+              </button>
               <button className="solid" type="button">
                 <Play size={17} fill="currentColor" /> 预览
               </button>
             </div>
           </div>
 
+          {isExportingVideo || exportMessage ? (
+            <div className="export-status-banner">
+              <strong>{isExportingVideo ? `正在导出视频 ${Math.round(exportProgress * 100)}%` : "视频导出结果"}</strong>
+              <span>{isExportingVideo ? "请保持当前页面打开，导出完成后会自动下载并保存到项目视频目录" : exportMessage}</span>
+            </div>
+          ) : null}
+
           <div className={`video-stage compact-stage ${activeOutlineScene ? "has-outline" : "is-empty"}`}>
             {currentOutline && activeOutlineScene ? (
               <>
-                <div className="stage-copy stage-copy-dynamic">
-                  <span className="stage-kicker">
-                    {currentOutline.promptKind === "image" ? "图片分镜预览" : "HTML 动画分镜预览"}
-                  </span>
-                  <h1>{currentOutline.title}</h1>
-                  <p>{activeOutlineScene.title}</p>
-                  <div className="stage-summary">
-                    <strong>旁白</strong>
-                    <span>{activeOutlineScene.narration}</span>
-                  </div>
-                </div>
                 <div className="stage-visual stage-visual-outline">
-                  <div className="stage-preview-placeholder">
-                    {currentOutline.promptKind === "image" ? <ImageIcon size={42} /> : <Code2 size={42} />}
-                    <strong>画面预览预留区</strong>
-                    <small>{currentOutline.promptKind === "image" ? "后续展示 AI 生成图片" : "后续展示 HTML 动画效果"}</small>
+                  {currentOutline.promptKind === "image" && activeSceneImage ? (
+                    <div className="stage-preview-media">
+                      <img
+                        alt={activeOutlineScene.title}
+                        className={`stage-preview-image ${isPreviewPlaying ? "playing" : ""}`}
+                        key={`stage-${activeOutlineScene.sceneNumber}`}
+                        src={activeSceneImage.publicUrl}
+                        style={{ transform: `scale(${1 + activeScenePlaybackProgress * 0.015})` }}
+                      />
+                    </div>
+                  ) : (
+                    <div className="stage-preview-placeholder">
+                      {currentOutline.promptKind === "image" ? <ImageIcon size={42} /> : <Code2 size={42} />}
+                      <strong>画面预览占位区</strong>
+                      <small>{currentOutline.promptKind === "image" ? "图片生成完成后会在这里展示当前分镜画面" : "后续展示 HTML 动画效果"}</small>
+                    </div>
+                  )}
+                  <div className={`stage-subtitle ${displaySubtitleText ? "visible" : ""}`}>
+                    <span>{displaySubtitleText}</span>
                   </div>
                 </div>
                 <div className="player-controls">
@@ -528,16 +1436,25 @@ export default function CreatePage() {
                   <span>
                     分镜 {activeOutlineScene.sceneNumber} / {visibleScenes.length}
                   </span>
+                  <span>{activeSceneAudio ? "旁白已生成" : "暂无旁白"}</span>
                   <span className="progress">
                     <i style={{ width: `${(activeOutlineScene.sceneNumber / visibleScenes.length) * 100}%` }} />
+                  </span>
+                </div>
+                <div className="player-controls player-controls-live">
+                  <button className="player-play-button" onClick={handleTogglePreviewPlayback} type="button">
+                    {isPreviewPlaying ? <Pause size={18} fill="currentColor" /> : <Play size={18} fill="currentColor" />}
+                  </button>
+                  <Volume2 size={18} />
+                  <span className="player-time">{formatDuration(currentPlaybackMs)}/{formatDuration(totalPlaybackDurationMs)}</span>
+                  <span className="progress">
+                    <i style={{ width: `${playbackProgressPercent}%` }} />
                   </span>
                 </div>
               </>
             ) : (
               <div className="preview-empty-state">
-                <div className="preview-empty-icon">
-                  {selectedMode === "slideshow" ? <ImageIcon size={36} /> : <Code2 size={36} />}
-                </div>
+                <div className="preview-empty-icon">{selectedMode === "slideshow" ? <ImageIcon size={36} /> : <Code2 size={36} />}</div>
                 <strong>这里还没有分镜内容</strong>
                 <p>先在右侧输入创作指令，生成视频大纲后，这里会自动加载分镜预览。</p>
               </div>
@@ -546,30 +1463,84 @@ export default function CreatePage() {
 
           <div className="scene-header compact-scene-header">
             <strong>分镜列表</strong>
-            <small>共 {visibleScenes.length} 个分镜</small>
+            <small>
+              共 {visibleScenes.length} 个分镜{canGenerateSceneImages ? ` · 已生成 ${generatedSceneCount}/${visibleScenes.length}` : ""}
+            </small>
+            {canGenerateSceneImages ? <span className="scene-generation-tip">支持跳过已生成分镜</span> : null}
+            {canGenerateSceneImages ? (
+              <>
+                <button disabled={isGeneratingSceneImages || generatedSceneCount === visibleScenes.length} onClick={() => void handleGenerateSceneImages()} type="button">
+                  {isGeneratingSceneImages ? <Loader2 size={16} /> : <ImageIcon size={16} />} 一键生成
+                </button>
+                <button disabled={!isGeneratingSceneImages} onClick={handleStopSceneGeneration} type="button">
+                  <X size={16} /> 中断生成
+                </button>
+              </>
+            ) : null}
             <button disabled type="button">
               <Plus size={16} /> 添加分镜
             </button>
           </div>
+          {sceneGenerationError ? <p className="scene-generation-error">{sceneGenerationError}</p> : null}
           <div className="scene-board">
             {visibleScenes.length > 0 ? (
               <div className="scene-strip compact-scene-strip">
-                {visibleScenes.map((scene, index) => (
-                  <button
-                    className={`scene-card ${selectedMode === "html" ? "violet" : "sky"} ${activeScene === index ? "active" : ""}`}
-                    key={`${scene.sceneNumber}-${scene.title}`}
-                    onClick={() => setActiveScene(index)}
-                    type="button"
-                  >
-                    <span className="scene-number">{scene.sceneNumber}</span>
-                    <span className="scene-thumb">
-                      {selectedMode === "html" ? <Video size={28} /> : <ImageIcon size={28} />}
-                    </span>
-                    <strong>{scene.title}</strong>
-                    <small>{shortenNarration(scene.narration)}</small>
-                    <em>{selectedMode === "html" ? "HTML" : "图片"}</em>
-                  </button>
-                ))}
+                {visibleScenes.map((scene, index) => {
+                  const sceneImage = sceneImageMap[scene.sceneNumber];
+                  const sceneAudio = sceneAudioMap[scene.sceneNumber];
+                  const isAudioPlayable = Boolean(sceneAudio);
+                  const isPlaying = playingSceneNumber === scene.sceneNumber;
+
+                  return (
+                    <div
+                      className={`scene-card ${selectedMode === "html" ? "violet" : "sky"} ${activeScene === index ? "active" : ""}`}
+                      key={`${scene.sceneNumber}-${scene.title}`}
+                      onClick={() => setActiveScene(index)}
+                      onKeyDown={(event) => {
+                        if (event.key === "Enter" || event.key === " ") {
+                          event.preventDefault();
+                          setActiveScene(index);
+                        }
+                      }}
+                      role="button"
+                      tabIndex={0}
+                    >
+                      <div className={`scene-thumb ${sceneImage ? "has-image" : ""}`}>
+                        <span className="scene-number">{String(scene.sceneNumber).padStart(2, "0")}</span>
+                        {sceneImage ? (
+                          <img alt={scene.title} className="scene-thumb-image" src={sceneImage.publicUrl} />
+                        ) : selectedMode === "html" ? (
+                          <Video size={24} />
+                        ) : (
+                          <ImageIcon size={24} />
+                        )}
+                      </div>
+                      <div className="scene-card-head compact">
+                        <strong>{scene.title}</strong>
+                        <button
+                          aria-label={isAudioPlayable ? `播放${scene.title}旁白` : `${scene.title}暂无旁白`}
+                          className={`scene-audio-button ${isAudioPlayable ? "enabled" : "disabled"} ${isPlaying ? "playing" : ""}`}
+                          disabled={!sceneAudio}
+                          onClick={(event) => {
+                            if (!sceneAudio) {
+                              event.stopPropagation();
+                              return;
+                            }
+
+                            void handlePlaySceneAudio(sceneAudio, event);
+                          }}
+                          type="button"
+                        >
+                          <Volume2 size={14} />
+                        </button>
+                      </div>
+                      <p className="scene-card-outline">{shortenNarration(scene.narration, 24)}</p>
+                      <em className="scene-card-status">
+                        {sceneImage ? "已出图" : generatingSceneNumber === scene.sceneNumber ? "生成中" : selectedMode === "html" ? "HTML" : "待出图"}
+                      </em>
+                    </div>
+                  );
+                })}
               </div>
             ) : (
               <div className="scene-board-empty">
@@ -580,12 +1551,7 @@ export default function CreatePage() {
           </div>
         </section>
 
-        <button
-          aria-label="调整预览和对话面板宽度"
-          className="panel-resizer"
-          onMouseDown={handleResizeStart}
-          type="button"
-        />
+        <button aria-label="调整预览和对话面板宽度" className="panel-resizer" onMouseDown={handleResizeStart} type="button" />
 
         <aside className="chat-panel compact-panel">
           <div className="panel-title">
@@ -609,11 +1575,7 @@ export default function CreatePage() {
                 <ImageIcon size={14} />
                 图片轮播模式
               </button>
-              <button
-                className={selectedMode === "html" ? "mode-choice active" : "mode-choice"}
-                onClick={() => handleModeChange("html")}
-                type="button"
-              >
+              <button className={selectedMode === "html" ? "mode-choice active" : "mode-choice"} onClick={() => handleModeChange("html")} type="button">
                 <Code2 size={14} />
                 HTML 动画模式
               </button>
@@ -753,32 +1715,78 @@ export default function CreatePage() {
               <strong>完整逐字稿</strong>
               <p>{currentOutline.fullScript}</p>
             </div>
+            {currentOutline.promptKind === "image" && currentOutline.globalVisualStylePrompt ? (
+              <div className="outline-modal-script">
+                <strong>全局画面风格提示词</strong>
+                <p>{currentOutline.globalVisualStylePrompt}</p>
+              </div>
+            ) : null}
             <div className="outline-scene-grid">
-              {currentOutline.scenes.map((scene) => (
-                <article className="outline-scene-detail-card" key={`detail-${scene.sceneNumber}`}>
-                  <div className="outline-scene-preview">
-                    {currentOutline.promptKind === "image" ? <ImageIcon size={28} /> : <Code2 size={28} />}
-                    <span>画面预览预留</span>
-                  </div>
-                  <div className="outline-scene-meta">
-                    <strong>
-                      {scene.sceneNumber}. {scene.title}
-                    </strong>
-                    <p>
-                      <span>分镜旁白</span>
-                      {scene.narration}
-                    </p>
-                    <p>
-                      <span>分镜提示词</span>
-                      {scene.visualPrompt}
-                    </p>
-                  </div>
-                </article>
-              ))}
+              {currentOutline.scenes.map((scene) => {
+                const sceneImage = sceneImageMap[scene.sceneNumber];
+                const sceneAudio = sceneAudioMap[scene.sceneNumber];
+                const isPlaying = playingSceneNumber === scene.sceneNumber;
+                const isImageRegenerating = Boolean(sceneActionLoadingMap[`image-${scene.sceneNumber}`]);
+                const isAudioRegenerating = Boolean(sceneActionLoadingMap[`audio-${scene.sceneNumber}`]);
+
+                return (
+                  <article className="outline-scene-detail-card" key={`detail-${scene.sceneNumber}`}>
+                    <div className="outline-scene-preview">
+                      {currentOutline.promptKind === "image" && sceneImage ? (
+                        <img alt={scene.title} className="outline-scene-image" src={sceneImage.publicUrl} />
+                      ) : (
+                        <>
+                          {currentOutline.promptKind === "image" ? <ImageIcon size={28} /> : <Code2 size={28} />}
+                          <span>画面预览占位</span>
+                        </>
+                      )}
+                    </div>
+                    <div className="outline-scene-actions">
+                      <button
+                        aria-label={sceneAudio ? `播放${scene.title}旁白` : `${scene.title}暂无旁白`}
+                        className={`scene-audio-button outline-scene-audio-button ${sceneAudio ? "enabled" : "disabled"} ${isPlaying ? "playing" : ""}`}
+                        disabled={!sceneAudio}
+                        onClick={(event) => {
+                          if (!sceneAudio) {
+                            event.stopPropagation();
+                            return;
+                          }
+
+                          void handlePlaySceneAudio(sceneAudio, event);
+                        }}
+                        type="button"
+                      >
+                        <Volume2 size={16} />
+                      </button>
+                      <button disabled={isImageRegenerating} onClick={(event) => void handleRegenerateSceneImage(scene.sceneNumber, event)} type="button">
+                        {isImageRegenerating ? <Loader2 size={14} /> : <ImageIcon size={14} />} 重新生成画面
+                      </button>
+                      <button disabled={isAudioRegenerating} onClick={(event) => void handleRegenerateSceneAudio(scene.sceneNumber, event)} type="button">
+                        {isAudioRegenerating ? <Loader2 size={14} /> : <Volume2 size={14} />} 重新生成旁白
+                      </button>
+                    </div>
+                    <div className="outline-scene-meta">
+                      <strong>
+                        {scene.sceneNumber}. {scene.title}
+                      </strong>
+                      <p>
+                        <span>分镜旁白</span>
+                        {scene.narration}
+                      </p>
+                      <p>
+                        <span>分镜提示词</span>
+                        {scene.visualPrompt}
+                      </p>
+                    </div>
+                  </article>
+                );
+              })}
             </div>
           </div>
         </div>
       ) : null}
+      <audio ref={audioRef} preload="none" />
+      <audio ref={previewAudioRef} preload="auto" />
     </main>
   );
 }

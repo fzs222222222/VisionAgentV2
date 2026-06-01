@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { addMessage, listMessages } from "@/app/lib/conversationStore";
-import { getProject, updateProject } from "@/app/lib/projectStore";
+import { buildProjectTitleFromPrompt, getProject, updateProject } from "@/app/lib/projectStore";
 import { analyzeUserIntent, generateVideoOutline, runIntentAction, VideoMode } from "@/app/lib/videoAgent";
 
 const projectModes: VideoMode[] = ["slideshow", "html"];
@@ -37,8 +37,23 @@ export async function POST(request: NextRequest) {
   await addMessage({ projectId, role: "user", content });
 
   try {
-    const intent = await analyzeUserIntent(content);
-    let assistantContent = runIntentAction(intent);
+    const analyzedIntent = await analyzeUserIntent(content);
+    const shouldFallbackToGenerateOutline =
+      analyzedIntent.action === "unsupported" &&
+      !currentProject.outlineContent.trim() &&
+      Boolean(content.trim());
+
+    const intent = shouldFallbackToGenerateOutline
+      ? {
+          action: "generate_video_outline" as const,
+          reason: "当前项目还没有视频大纲，已将本次主题输入按生成大纲处理",
+          targetScene: null,
+        }
+      : analyzedIntent;
+
+    let assistantContent = shouldFallbackToGenerateOutline
+      ? "已根据当前主题自动进入视频大纲生成流程。"
+      : runIntentAction(intent);
     let updatedProject = currentProject;
     let outline = null;
 
@@ -46,11 +61,16 @@ export async function POST(request: NextRequest) {
       outline = await generateVideoOutline(content, mode as VideoMode);
       assistantContent = `已生成视频大纲，共 ${outline.scenes.length} 个分镜。你可以先在卡片里快速浏览，再查看完整大纲内容。`;
 
+      const nextTitle =
+        buildProjectTitleFromPrompt(content, outline.title) || buildProjectTitleFromPrompt(outline.title, currentProject.title) || currentProject.title;
+
       updatedProject =
         (await updateProject({
           uuid: projectId,
+          title: nextTitle,
           type: mode as VideoMode,
           outlineContent: JSON.stringify(outline),
+          videoSource: "",
         })) ?? currentProject;
     } else if (currentProject.type !== mode) {
       updatedProject =

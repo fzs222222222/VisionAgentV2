@@ -30,6 +30,7 @@ export type VideoOutline = {
   fullScript: string;
   mode: VideoMode;
   promptKind: "image" | "html";
+  globalVisualStylePrompt?: string;
   scenes: VideoOutlineScene[];
 };
 
@@ -43,7 +44,6 @@ const supportedActions: IntentAction[] = [
 ];
 
 const intentSystemPrompt = `你是一个视频创作助手，需要先判断用户输入对应的操作意图。
-
 请只从以下 action 中选择一个最合适的值返回：
 1. generate_video_outline：生成完整视频大纲，包括完整逐字稿和分镜列表。
 2. regenerate_video_outline：重新生成整个视频大纲。
@@ -51,11 +51,9 @@ const intentSystemPrompt = `你是一个视频创作助手，需要先判断用�
 4. delete_scene：删除一个分镜。
 5. regenerate_scene：重新生成某个分镜。
 6. unsupported：其他暂不支持的指令。
-
 只返回 JSON，不要返回 Markdown，不要包裹代码块。
 reason 使用简短中文解释判断原因。
 如果没有明确分镜序号，targetScene 返回 null。
-
 示例：
 {
   "action": "regenerate_scene",
@@ -66,26 +64,24 @@ reason 使用简短中文解释判断原因。
 function buildOutlineSystemPrompt(mode: VideoMode) {
   const promptRule =
     mode === "slideshow"
-      ? "visualPrompt 必须是图片生成提示词，强调主体、环境、构图、光线、风格、材质、景别和镜头感，适合后续生成静态分镜图片。"
+      ? "你必须先根据整支视频脚本选择一组统一的全局图像风格提示词，并输出到 globalVisualStylePrompt。它需要概括整组画面的时代气质、摄影语言、色调、光线、材质、镜头、画幅、质感与审美方向。随后每个分镜的 visualPrompt 都必须以前置这组全局风格提示词开头，再补充分镜自己的主体、场景、动作、构图和细节，使整组画面风格保持一致。"
       : "visualPrompt 必须是 HTML 网页动画提示词，强调页面结构、组件布局、动效、转场、数据可视化、交互表现和动画节奏，适合后续生成网页动画。";
 
   return `你是一个专业的视频策划与分镜编导助手。
-
 请根据用户输入，先生成一份完整的视频脚本逐字稿，再将这份逐字稿拆分为 6 到 30 个分镜。
 当前视频模式是：${mode === "slideshow" ? "图片轮播视频" : "HTML 动画视频"}。
 ${promptRule}
 
 请确保输出满足以下要求：
-1. 整体内容完整、自洽，可直接进入后续视频制作。
+1. 整体内容完整、自然，可直接进入后续视频制作。
 2. 分镜数量必须在 6 到 30 个之间。
 3. 每个分镜都必须包含：sceneNumber、title、narration、visualPrompt。
 4. narration 是该分镜的中文旁白逐字稿，要求自然、口语化、适合配音。
-5. visualPrompt 必须和当前模式严格匹配，不能混用图片提示词与 HTML 动画提示词。
-6. sceneNumber 从 1 开始连续递增。
-7. title、summary、fullScript、scenes 都必须有内容。
-
+5. 当模式为 slideshow 时，必须额外输出 globalVisualStylePrompt，并确保每个 visualPrompt 都以前置这组全局风格提示词开头。
+6. visualPrompt 必须和当前模式严格匹配，不能混用图片提示词与 HTML 动画提示词。
+7. sceneNumber 从 1 开始连续递增。
+8. title、summary、fullScript、scenes 都必须有内容。
 只返回 JSON，不要返回 Markdown，不要包裹代码块。
-
 返回结构：
 {
   "title": "视频标题",
@@ -93,6 +89,7 @@ ${promptRule}
   "fullScript": "完整逐字稿",
   "mode": "${mode}",
   "promptKind": "${mode === "slideshow" ? "image" : "html"}",
+  "globalVisualStylePrompt": "${mode === "slideshow" ? "统一的全局图像风格提示词" : ""}",
   "scenes": [
     {
       "sceneNumber": 1,
@@ -139,10 +136,7 @@ function readDotEnvValues() {
       value = value.slice(0, inlineCommentIndex).trim();
     }
 
-    if (
-      (value.startsWith("\"") && value.endsWith("\"")) ||
-      (value.startsWith("'") && value.endsWith("'"))
-    ) {
+    if ((value.startsWith("\"") && value.endsWith("\"")) || (value.startsWith("'") && value.endsWith("'"))) {
       value = value.slice(1, -1);
     }
 
@@ -248,6 +242,29 @@ async function requestChatJson(
   return parseJsonObject(content);
 }
 
+function normalizePromptSegment(value: string) {
+  return value.replace(/\s+/g, " ").replace(/^[,，;；:：\s]+|[,，;；:：\s]+$/g, "").trim();
+}
+
+function mergeGlobalStylePrompt(globalStylePrompt: string, scenePrompt: string) {
+  const normalizedGlobal = normalizePromptSegment(globalStylePrompt);
+  const normalizedScene = normalizePromptSegment(scenePrompt);
+
+  if (!normalizedGlobal) {
+    return normalizedScene;
+  }
+
+  if (!normalizedScene) {
+    return normalizedGlobal;
+  }
+
+  if (normalizedScene.startsWith(normalizedGlobal)) {
+    return normalizedScene;
+  }
+
+  return `${normalizedGlobal}, ${normalizedScene}`;
+}
+
 export function validateIntentAnalysis(value: unknown): IntentAnalysis {
   if (!value || typeof value !== "object") {
     throw new Error("AI returned a non-object JSON payload");
@@ -305,6 +322,13 @@ export function validateVideoOutline(value: unknown): VideoOutline {
     throw new Error("AI returned an invalid promptKind");
   }
 
+  const globalVisualStylePrompt =
+    typeof record.globalVisualStylePrompt === "string" ? normalizePromptSegment(record.globalVisualStylePrompt) : "";
+
+  if (record.promptKind === "image" && !globalVisualStylePrompt) {
+    throw new Error("AI returned an empty globalVisualStylePrompt for slideshow mode");
+  }
+
   if (!scenes || scenes.length < 6 || scenes.length > 30) {
     throw new Error("AI returned an invalid scene count");
   }
@@ -333,11 +357,16 @@ export function validateVideoOutline(value: unknown): VideoOutline {
       throw new Error(`AI returned an empty visualPrompt at index ${index}`);
     }
 
+    const visualPrompt =
+      record.promptKind === "image"
+        ? mergeGlobalStylePrompt(globalVisualStylePrompt, item.visualPrompt.trim())
+        : item.visualPrompt.trim();
+
     return {
       sceneNumber,
       title: item.title.trim(),
       narration: item.narration.trim(),
-      visualPrompt: item.visualPrompt.trim(),
+      visualPrompt,
     };
   });
 
@@ -347,6 +376,7 @@ export function validateVideoOutline(value: unknown): VideoOutline {
     fullScript: record.fullScript.trim(),
     mode: record.mode,
     promptKind: record.promptKind,
+    globalVisualStylePrompt,
     scenes: normalizedScenes,
   };
 }
@@ -363,16 +393,7 @@ export async function analyzeUserIntent(userPrompt: string): Promise<IntentAnaly
 
   for (const enforceJson of [true, false]) {
     try {
-      const payload = await requestChatJson(
-        endpoint,
-        apiKey,
-        model,
-        intentSystemPrompt,
-        userPrompt,
-        0.1,
-        enforceJson,
-      );
-
+      const payload = await requestChatJson(endpoint, apiKey, model, intentSystemPrompt, userPrompt, 0.1, enforceJson);
       return validateIntentAnalysis(payload);
     } catch (error) {
       lastError = error;
@@ -391,15 +412,7 @@ export async function generateVideoOutline(userPrompt: string, mode: VideoMode):
   }
 
   const endpoint = `${baseUrl.replace(/\/$/, "")}/chat/completions`;
-  const payload = await requestChatJson(
-    endpoint,
-    apiKey,
-    model,
-    buildOutlineSystemPrompt(mode),
-    userPrompt,
-    0.4,
-    true,
-  );
+  const payload = await requestChatJson(endpoint, apiKey, model, buildOutlineSystemPrompt(mode), userPrompt, 0.4, true);
 
   return validateVideoOutline(payload);
 }
