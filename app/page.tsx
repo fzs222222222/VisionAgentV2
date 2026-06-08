@@ -1,7 +1,7 @@
 "use client";
 
+import { FormEvent, useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
-import { useState } from "react";
 import {
   ArrowRight,
   Bell,
@@ -24,6 +24,7 @@ import {
   UserCircle2,
   Volume2,
 } from "lucide-react";
+import { useAuthSession } from "@/app/lib/useAuthSession";
 
 type NavKey = "home" | "projects" | "templates" | "assets" | "help";
 type ModeKey = "slideshow" | "html";
@@ -49,7 +50,7 @@ const modes = [
     key: "html" as ModeKey,
     title: "HTML 视频模式",
     description: "AI 生成网页动画\n多段动画合成视频",
-    detail: "系统调用 AI 生成网页动画，多个网页动画形成视频。",
+    detail: "系统调用 AI 生成网页动画，多个网页动画片段合成视频。",
     feature: "适合数据演示、技术讲解、动态交互类视觉内容。",
     icon: Code2,
   },
@@ -84,10 +85,32 @@ const navMessage: Record<NavKey, string> = {
 
 export default function Home() {
   const router = useRouter();
+  const { session, isLoading: isLoadingSession, refreshSession, setSession } = useAuthSession();
   const [activeNav, setActiveNav] = useState<NavKey>("home");
   const [statusText, setStatusText] = useState(navMessage.home);
   const [notifyOn, setNotifyOn] = useState(true);
   const [creatingMode, setCreatingMode] = useState<ModeKey | null>(null);
+  const [isAuthDialogOpen, setIsAuthDialogOpen] = useState(false);
+  const [authMode, setAuthMode] = useState<"login" | "register">("login");
+  const [authUsername, setAuthUsername] = useState("");
+  const [authPassword, setAuthPassword] = useState("");
+  const [authError, setAuthError] = useState("");
+  const [isSubmittingAuth, setIsSubmittingAuth] = useState(false);
+
+  useEffect(() => {
+    if (session?.username) {
+      setStatusText(`当前登录用户：${session.username}，可选择创作模式开始制作。`);
+    }
+  }, [session?.username]);
+
+  const userInitial = session?.username?.trim().slice(0, 1).toUpperCase() ?? "U";
+
+  function openAuthDialog(mode: "login" | "register") {
+    setAuthMode(mode);
+    setAuthError("");
+    setAuthPassword("");
+    setIsAuthDialogOpen(true);
+  }
 
   async function createProject(mode: ModeKey) {
     if (creatingMode) return;
@@ -111,6 +134,54 @@ export default function Home() {
       const message = error instanceof Error ? error.message : "创建项目失败";
       setStatusText(message);
       setCreatingMode(null);
+    }
+  }
+
+  async function handleAuthSubmit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (isSubmittingAuth) return;
+
+    setIsSubmittingAuth(true);
+    setAuthError("");
+
+    try {
+      const response = await fetch(`/api/auth/${authMode}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          username: authUsername.trim(),
+          password: authPassword,
+        }),
+      });
+      const data = (await response.json()) as {
+        error?: string;
+        session?: { userId: number; username: string } | null;
+      };
+
+      if (!response.ok || !data.session) {
+        throw new Error(data.error ?? `${authMode === "login" ? "登录" : "注册"}失败`);
+      }
+
+      setSession(data.session);
+      setIsAuthDialogOpen(false);
+      setAuthPassword("");
+      setStatusText(`欢迎回来，${data.session.username}。现在可以继续与 VisionAgent 协作创作。`);
+      await refreshSession();
+    } catch (error) {
+      setAuthError(error instanceof Error ? error.message : "认证失败");
+    } finally {
+      setIsSubmittingAuth(false);
+    }
+  }
+
+  async function handleLogout() {
+    try {
+      await fetch("/api/auth/logout", { method: "POST" });
+      setSession(null);
+      setIsAuthDialogOpen(false);
+      setStatusText(navMessage[activeNav]);
+    } catch {
+      setStatusText("退出登录失败，请稍后重试。");
     }
   }
 
@@ -147,20 +218,27 @@ export default function Home() {
 
             <div className="landing-actions">
               <button
+                aria-label="通知开关"
                 className={notifyOn ? "icon-button active" : "icon-button"}
                 onClick={() => setNotifyOn((value) => !value)}
                 type="button"
-                aria-label="通知开关"
               >
                 <Bell size={18} />
               </button>
               <button
-                className="icon-button"
-                onClick={() => setStatusText("个人中心占位，后续可接入账号信息、偏好设置与团队空间。")}
+                aria-label={session ? "当前用户" : "登录或注册"}
+                className={`icon-button ${session ? "is-authenticated" : ""}`}
+                onClick={() => {
+                  if (session) {
+                    setIsAuthDialogOpen(true);
+                    setAuthError("");
+                    return;
+                  }
+                  openAuthDialog("login");
+                }}
                 type="button"
-                aria-label="个人中心"
               >
-                <UserCircle2 size={22} />
+                {session ? <span className="user-chip">{userInitial}</span> : <UserCircle2 size={22} />}
               </button>
             </div>
           </header>
@@ -182,7 +260,7 @@ export default function Home() {
             {modes.map((mode, index) => (
               <article className={`landing-mode-card ${mode.key}`} key={mode.key}>
                 <div className="landing-mode-art">
-                  <button className="art-arrow left" aria-label="上一张" type="button">
+                  <button aria-label="上一张" className="art-arrow left" type="button">
                     <ChevronLeft size={18} />
                   </button>
                   <div className="art-stack">
@@ -196,7 +274,7 @@ export default function Home() {
                     <Play size={18} fill="currentColor" />
                   </button>
                   {index === 0 ? (
-                    <button className="art-arrow right" aria-label="下一张" type="button">
+                    <button aria-label="下一张" className="art-arrow right" type="button">
                       <ChevronRight size={18} />
                     </button>
                   ) : null}
@@ -242,7 +320,7 @@ export default function Home() {
               <div className="workflow-step-card" key={item.title}>
                 <item.icon size={20} />
                 <span>{item.title}</span>
-                {index < workflow.length - 1 ? <ArrowRight size={18} className="workflow-arrow" /> : null}
+                {index < workflow.length - 1 ? <ArrowRight className="workflow-arrow" size={18} /> : null}
               </div>
             ))}
           </div>
@@ -294,6 +372,92 @@ export default function Home() {
           </article>
         </section>
       </section>
+
+      {isAuthDialogOpen ? (
+        <div className="auth-dialog-backdrop" onClick={() => setIsAuthDialogOpen(false)} role="presentation">
+          <section aria-label="用户登录与注册" className="auth-dialog" onClick={(event) => event.stopPropagation()}>
+            {session ? (
+              <>
+                <div className="auth-dialog-head">
+                  <div>
+                    <strong>当前账号</strong>
+                    <small>已登录，可继续与 AI 助手协作。</small>
+                  </div>
+                  <button className="ghost-button" onClick={() => setIsAuthDialogOpen(false)} type="button">
+                    关闭
+                  </button>
+                </div>
+                <div className="auth-session-card">
+                  <span className="auth-session-avatar">{userInitial}</span>
+                  <div>
+                    <strong>{session.username}</strong>
+                    <small>{isLoadingSession ? "同步登录状态中..." : "登录状态已生效"}</small>
+                  </div>
+                </div>
+                <div className="auth-dialog-actions">
+                  <button className="auth-primary-button secondary" onClick={handleLogout} type="button">
+                    退出登录
+                  </button>
+                </div>
+              </>
+            ) : (
+              <>
+                <div className="auth-dialog-head">
+                  <div>
+                    <strong>{authMode === "login" ? "用户登录" : "新用户注册"}</strong>
+                    <small>{authMode === "login" ? "输入账号密码继续创作。" : "注册后会自动登录当前设备。"}</small>
+                  </div>
+                  <div className="auth-switch">
+                    <button className={authMode === "login" ? "active" : ""} onClick={() => setAuthMode("login")} type="button">
+                      登录
+                    </button>
+                    <button className={authMode === "register" ? "active" : ""} onClick={() => setAuthMode("register")} type="button">
+                      注册
+                    </button>
+                  </div>
+                </div>
+                <form className="auth-form" onSubmit={handleAuthSubmit}>
+                  <label>
+                    用户名
+                    <input
+                      autoFocus
+                      maxLength={32}
+                      onChange={(event) => setAuthUsername(event.target.value)}
+                      placeholder="请输入用户名"
+                      value={authUsername}
+                    />
+                  </label>
+                  <label>
+                    密码
+                    <input
+                      maxLength={64}
+                      minLength={6}
+                      onChange={(event) => setAuthPassword(event.target.value)}
+                      placeholder="请输入密码"
+                      type="password"
+                      value={authPassword}
+                    />
+                  </label>
+                  {authError ? <p className="auth-error-text">{authError}</p> : null}
+                  <div className="auth-dialog-actions">
+                    <button className="auth-primary-button" disabled={isSubmittingAuth} type="submit">
+                      {isSubmittingAuth ? <Loader2 size={16} /> : null}
+                      {authMode === "login" ? "登录并继续" : "注册并登录"}
+                    </button>
+                    <button
+                      className="auth-primary-button secondary"
+                      onClick={() => openAuthDialog(authMode === "login" ? "register" : "login")}
+                      type="button"
+                    >
+                      {authMode === "login" ? "新用户注册" : "已有账号去登录"}
+                    </button>
+                  </div>
+                </form>
+              </>
+            )}
+          </section>
+        </div>
+      ) : null}
     </main>
   );
 }

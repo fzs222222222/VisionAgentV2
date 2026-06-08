@@ -1,15 +1,21 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { NextRequest, NextResponse } from "next/server";
+import { DEFAULT_HTML_VIDEO_STYLE_ID, getHtmlVideoStyle } from "@/app/lib/htmlVideoStyles";
 import { getProject, updateProject } from "@/app/lib/projectStore";
 import {
   getSceneAudioMap,
+  getSceneHtmlMap,
   getSceneImageMap,
   SceneAudioSource,
+  SceneHtmlSource,
   SceneImageSource,
+  shiftSceneNumbersAfterInsertion,
   upsertSceneAudioSource,
+  upsertSceneHtmlSource,
   upsertSceneImageSource,
 } from "@/app/lib/videoSource";
+import { generateSceneHtmlCode, generateSceneHtmlRevision, reviseSceneVisualPrompt, VideoOutline } from "@/app/lib/videoAgent";
 
 type OutlineScene = {
   sceneNumber: number;
@@ -21,7 +27,7 @@ type OutlineScene = {
 type OutlinePayload = {
   promptKind: "image" | "html";
   scenes: OutlineScene[];
-};
+} & Pick<VideoOutline, "title" | "summary" | "fullScript" | "globalVisualStylePrompt" | "htmlVideoStyleId" | "htmlVideoStyleName">;
 
 function parseOutline(content: string) {
   if (!content) {
@@ -30,14 +36,234 @@ function parseOutline(content: string) {
 
   try {
     const parsed = JSON.parse(content) as OutlinePayload;
-    if (!Array.isArray(parsed?.scenes) || parsed.promptKind !== "image") {
+    if (!Array.isArray(parsed?.scenes) || (parsed.promptKind !== "image" && parsed.promptKind !== "html")) {
       return null;
     }
 
-    return parsed;
+    return {
+      title: typeof parsed.title === "string" ? parsed.title : "",
+      summary: typeof parsed.summary === "string" ? parsed.summary : "",
+      fullScript: typeof parsed.fullScript === "string" ? parsed.fullScript : "",
+      globalVisualStylePrompt: typeof parsed.globalVisualStylePrompt === "string" ? parsed.globalVisualStylePrompt : "",
+      htmlVideoStyleId: typeof parsed.htmlVideoStyleId === "string" ? parsed.htmlVideoStyleId : undefined,
+      htmlVideoStyleName: typeof parsed.htmlVideoStyleName === "string" ? parsed.htmlVideoStyleName : undefined,
+      promptKind: parsed.promptKind,
+      scenes: parsed.scenes,
+    };
   } catch {
     return null;
   }
+}
+
+export async function regenerateSceneVisualByInstruction(input: {
+  projectId: string;
+  projectVideoSource: string;
+  outline: OutlinePayload;
+  sceneNumber: number;
+  revisionRequest: string;
+  htmlVideoStyleId?: string;
+}) {
+  const scene = input.outline.scenes.find((item) => item.sceneNumber === input.sceneNumber);
+  if (!scene) {
+    throw new Error("TARGET_SCENE_NOT_FOUND");
+  }
+
+  const selectedHtmlStyle =
+    input.outline.promptKind === "html"
+      ? getHtmlVideoStyle(input.htmlVideoStyleId || input.outline.htmlVideoStyleId || DEFAULT_HTML_VIDEO_STYLE_ID)
+      : null;
+
+  const existingImageMap = getSceneImageMap(input.projectVideoSource);
+  const existingHtmlMap = getSceneHtmlMap(input.projectVideoSource);
+  const currentSceneHtml = existingHtmlMap[input.sceneNumber]?.html ?? null;
+  let currentVideoSource = input.projectVideoSource;
+  const signal = new AbortController().signal;
+
+  if (input.outline.promptKind === "image") {
+    const revisedVisualPrompt = await reviseSceneVisualPrompt({
+      scene,
+      revisionRequest: input.revisionRequest,
+      currentSceneHtml: null,
+    });
+    const imageResult = await createImage(revisedVisualPrompt, signal);
+    const fileInfo = await saveRemoteImage(input.projectId, input.sceneNumber, imageResult.imageUrl, signal);
+    const sceneImage: SceneImageSource = {
+      sceneNumber: input.sceneNumber,
+      title: scene.title,
+      prompt: imageResult.usedPrompt,
+      filename: fileInfo.filename,
+      relativePath: fileInfo.relativePath,
+      publicUrl: fileInfo.publicUrl,
+      createdAt: new Date().toISOString(),
+    };
+    currentVideoSource = upsertSceneImageSource(currentVideoSource, sceneImage);
+    const updatedProject = await updateProject({
+      uuid: input.projectId,
+      videoSource: currentVideoSource,
+    });
+
+    return {
+      updatedProject,
+      sceneImage,
+      sceneHtml: null,
+      usedVisualPrompt: revisedVisualPrompt,
+    };
+  }
+
+  const revisedVisualPrompt = await reviseSceneVisualPrompt({
+    scene,
+    revisionRequest: input.revisionRequest,
+    currentSceneHtml,
+  });
+  const previousSceneHtml = input.sceneNumber > 1 ? existingHtmlMap[input.sceneNumber - 1]?.html ?? null : null;
+  const htmlResult = await generateSceneHtmlRevision({
+    outline: {
+      title: input.outline.title,
+      summary: input.outline.summary,
+      fullScript: input.outline.fullScript,
+      mode: "html",
+      promptKind: "html",
+      globalVisualStylePrompt: selectedHtmlStyle?.stylePrompt ?? input.outline.globalVisualStylePrompt,
+      htmlVideoStyleId: selectedHtmlStyle?.id ?? input.outline.htmlVideoStyleId,
+      htmlVideoStyleName: selectedHtmlStyle?.nameZh ?? input.outline.htmlVideoStyleName,
+      scenes: input.outline.scenes,
+    },
+    scene: {
+      ...scene,
+      visualPrompt: revisedVisualPrompt,
+    },
+    currentSceneHtml,
+    revisionRequest: input.revisionRequest,
+    previousSceneHtml,
+  });
+
+  const sceneHtml: SceneHtmlSource = {
+    sceneNumber: input.sceneNumber,
+    title: scene.title,
+    prompt: revisedVisualPrompt,
+    html: htmlResult.html,
+    createdAt: new Date().toISOString(),
+  };
+  currentVideoSource = upsertSceneHtmlSource(currentVideoSource, sceneHtml);
+  const updatedProject = await updateProject({
+    uuid: input.projectId,
+    videoSource: currentVideoSource,
+  });
+
+  return {
+    updatedProject,
+    sceneImage: null,
+    sceneHtml,
+    usedVisualPrompt: revisedVisualPrompt,
+  };
+}
+
+export async function generateSceneAssetsForScene(input: {
+  projectId: string;
+  videoSource: string;
+  outline: OutlinePayload;
+  scene: OutlineScene;
+  htmlVideoStyleId?: string;
+}) {
+  const selectedHtmlStyle =
+    input.outline.promptKind === "html"
+      ? getHtmlVideoStyle(input.htmlVideoStyleId || input.outline.htmlVideoStyleId || DEFAULT_HTML_VIDEO_STYLE_ID)
+      : null;
+
+  const existingHtmlMap = getSceneHtmlMap(input.videoSource);
+  let currentVideoSource = input.videoSource;
+  let sceneImage: SceneImageSource | null = null;
+  let sceneHtml: SceneHtmlSource | null = null;
+  let sceneAudio: SceneAudioSource | null = null;
+
+  if (input.outline.promptKind === "image") {
+    const imageResult = await createImage(input.scene.visualPrompt, inputSignal);
+    const fileInfo = await saveRemoteImage(input.projectId, input.scene.sceneNumber, imageResult.imageUrl, inputSignal);
+    sceneImage = {
+      sceneNumber: input.scene.sceneNumber,
+      title: input.scene.title,
+      prompt: imageResult.usedPrompt,
+      filename: fileInfo.filename,
+      relativePath: fileInfo.relativePath,
+      publicUrl: fileInfo.publicUrl,
+      createdAt: new Date().toISOString(),
+    };
+    currentVideoSource = upsertSceneImageSource(currentVideoSource, sceneImage);
+  } else {
+    const previousSceneHtml = input.scene.sceneNumber > 1 ? existingHtmlMap[input.scene.sceneNumber - 1]?.html ?? null : null;
+    const htmlResult = await generateSceneHtmlCode({
+      outline: {
+        title: input.outline.title,
+        summary: input.outline.summary,
+        fullScript: input.outline.fullScript,
+        mode: "html",
+        promptKind: "html",
+        globalVisualStylePrompt: selectedHtmlStyle?.stylePrompt ?? input.outline.globalVisualStylePrompt,
+        htmlVideoStyleId: selectedHtmlStyle?.id ?? input.outline.htmlVideoStyleId,
+        htmlVideoStyleName: selectedHtmlStyle?.nameZh ?? input.outline.htmlVideoStyleName,
+        scenes: input.outline.scenes,
+      },
+      scene: input.scene,
+      previousSceneHtml,
+    });
+    sceneHtml = {
+      sceneNumber: input.scene.sceneNumber,
+      title: input.scene.title,
+      prompt: input.scene.visualPrompt,
+      html: htmlResult.html,
+      createdAt: new Date().toISOString(),
+    };
+    currentVideoSource = upsertSceneHtmlSource(currentVideoSource, sceneHtml);
+  }
+
+  const tts = await createSceneAudio(input.scene, inputSignal);
+  const audioFileInfo = await saveSceneAudio(input.projectId, input.scene.sceneNumber, tts.bytes, tts.extension);
+  const durationMs = getAudioDurationMs(tts.bytes, tts.extension);
+  sceneAudio = {
+    sceneNumber: input.scene.sceneNumber,
+    title: input.scene.title,
+    narration: input.scene.narration,
+    voice: tts.voice,
+    filename: audioFileInfo.filename,
+    relativePath: audioFileInfo.relativePath,
+    publicUrl: audioFileInfo.publicUrl,
+    durationMs,
+    createdAt: new Date().toISOString(),
+  };
+  currentVideoSource = upsertSceneAudioSource(currentVideoSource, sceneAudio);
+
+  const updatedProject = await updateProject({
+    uuid: input.projectId,
+    videoSource: currentVideoSource,
+  });
+
+  return {
+    updatedProject,
+    videoSource: currentVideoSource,
+    sceneImage,
+    sceneHtml,
+    sceneAudio,
+  };
+}
+
+const inputSignal = new AbortController().signal;
+
+export async function insertGeneratedSceneAndAssets(input: {
+  projectId: string;
+  videoSource: string;
+  outline: OutlinePayload;
+  newScene: OutlineScene;
+  insertAfterScene: number;
+  htmlVideoStyleId?: string;
+}) {
+  const shiftedVideoSource = shiftSceneNumbersAfterInsertion(input.videoSource, input.insertAfterScene);
+  return generateSceneAssetsForScene({
+    projectId: input.projectId,
+    videoSource: shiftedVideoSource,
+    outline: input.outline,
+    scene: input.newScene,
+    htmlVideoStyleId: input.htmlVideoStyleId,
+  });
 }
 
 function getConfigValue(name: string) {
@@ -48,7 +274,7 @@ function getAiServiceConfig() {
   return {
     baseUrl: getConfigValue("AI_BASE_URL") || getConfigValue("OPENAI_BASE_URL"),
     apiKey: getConfigValue("AI_API_KEY") || getConfigValue("OPENAI_API_KEY"),
-    model: getConfigValue("OPENAI_MODEL") || "gpt-4o-mini",
+    model: getConfigValue("OPENAI_MODEL") || "gemini-3.1-pro-preview",
     voice: getConfigValue("QWEN_TTS_VOICE") || "Cherry",
   };
 }
@@ -883,7 +1109,9 @@ export async function POST(request: NextRequest, context: { params: Promise<{ pr
   const body = await request.json().catch(() => null);
   const sceneNumber = typeof body?.sceneNumber === "number" ? body.sceneNumber : Number(body?.sceneNumber);
   const regenerateImage = Boolean(body && typeof body === "object" && (body as Record<string, unknown>).regenerateImage);
+  const regenerateHtml = Boolean(body && typeof body === "object" && (body as Record<string, unknown>).regenerateHtml);
   const regenerateAudio = Boolean(body && typeof body === "object" && (body as Record<string, unknown>).regenerateAudio);
+  const htmlVideoStyleId = typeof body?.htmlVideoStyleId === "string" ? body.htmlVideoStyleId.trim() : "";
 
   if (!projectId || !Number.isInteger(sceneNumber) || sceneNumber < 1) {
     return NextResponse.json({ error: "projectId 或 sceneNumber 不正确" }, { status: 400 });
@@ -899,20 +1127,27 @@ export async function POST(request: NextRequest, context: { params: Promise<{ pr
     return NextResponse.json({ error: "当前项目没有可用于生成分镜图片的图片大纲" }, { status: 400 });
   }
 
+  const selectedHtmlStyle =
+    outline.promptKind === "html"
+      ? getHtmlVideoStyle(htmlVideoStyleId || outline.htmlVideoStyleId || DEFAULT_HTML_VIDEO_STYLE_ID)
+      : null;
+
   const scene = outline.scenes.find((item) => item.sceneNumber === sceneNumber);
   if (!scene) {
     return NextResponse.json({ error: "分镜不存在" }, { status: 404 });
   }
 
   const existingImageMap = getSceneImageMap(project.videoSource);
+  const existingHtmlMap = getSceneHtmlMap(project.videoSource);
   const existingAudioMap = getSceneAudioMap(project.videoSource);
   let sceneImage: SceneImageSource | null = regenerateImage ? null : existingImageMap[sceneNumber] ?? null;
+  let sceneHtml: SceneHtmlSource | null = regenerateHtml ? null : existingHtmlMap[sceneNumber] ?? null;
   let sceneAudio: SceneAudioSource | null = regenerateAudio ? null : existingAudioMap[sceneNumber] ?? null;
 
   try {
     let currentVideoSource = project.videoSource;
 
-    if (!sceneImage) {
+    if (outline.promptKind === "image" && !sceneImage) {
       const imageResult = await createImage(scene.visualPrompt, request.signal);
       const fileInfo = await saveRemoteImage(projectId, sceneNumber, imageResult.imageUrl, request.signal);
 
@@ -927,6 +1162,35 @@ export async function POST(request: NextRequest, context: { params: Promise<{ pr
       };
 
       currentVideoSource = upsertSceneImageSource(currentVideoSource, sceneImage);
+    }
+
+    if (outline.promptKind === "html" && !sceneHtml) {
+      const previousSceneHtml = sceneNumber > 1 ? existingHtmlMap[sceneNumber - 1]?.html ?? null : null;
+      const htmlResult = await generateSceneHtmlCode({
+        outline: {
+          title: outline.title,
+          summary: outline.summary,
+          fullScript: outline.fullScript,
+          mode: "html",
+          promptKind: "html",
+          globalVisualStylePrompt: selectedHtmlStyle?.stylePrompt ?? outline.globalVisualStylePrompt,
+          htmlVideoStyleId: selectedHtmlStyle?.id ?? outline.htmlVideoStyleId,
+          htmlVideoStyleName: selectedHtmlStyle?.nameZh ?? outline.htmlVideoStyleName,
+          scenes: outline.scenes,
+        },
+        scene,
+        previousSceneHtml,
+      });
+
+      sceneHtml = {
+        sceneNumber,
+        title: scene.title,
+        prompt: scene.visualPrompt,
+        html: htmlResult.html,
+        createdAt: new Date().toISOString(),
+      };
+
+      currentVideoSource = upsertSceneHtmlSource(currentVideoSource, sceneHtml);
     }
 
     if (!sceneAudio) {
@@ -958,8 +1222,12 @@ export async function POST(request: NextRequest, context: { params: Promise<{ pr
     });
 
     return NextResponse.json({
-      skipped: !regenerateImage && !regenerateAudio && Boolean(existingImageMap[sceneNumber] && existingAudioMap[sceneNumber]),
+      skipped:
+        outline.promptKind === "image"
+          ? !regenerateImage && !regenerateAudio && Boolean(existingImageMap[sceneNumber] && existingAudioMap[sceneNumber])
+          : !regenerateHtml && !regenerateAudio && Boolean(existingHtmlMap[sceneNumber] && existingAudioMap[sceneNumber]),
       sceneImage,
+      sceneHtml,
       sceneAudio,
       project: updatedProject,
     });

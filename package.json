@@ -10,6 +10,7 @@
   },
   "dependencies": {
     "lucide-react": "^0.468.0",
+    "mp4-muxer": "^5.2.2",
     "mysql2": "^3.22.4",
     "next": "^15.0.0",
     "react": "^19.0.0",

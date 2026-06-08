@@ -5,6 +5,11 @@ import type { IntentAnalysis, VideoOutline } from "@/app/lib/videoAgent";
 export type AssistantPayload = {
   intent?: IntentAnalysis | null;
   outline?: VideoOutline | null;
+  confirmation?: {
+    type: "regenerate_video_outline";
+    originalPrompt: string;
+    revisionRequest: string;
+  } | null;
 };
 
 export type ConversationMessage = {
@@ -52,6 +57,24 @@ function mapConversationRow(row: ConversationRow): ConversationMessage {
     intentReason: row.intent_reason,
     intentPayload,
   };
+}
+
+export async function getMessageById(id: string) {
+  const numericId = Number(id);
+  if (!Number.isInteger(numericId) || numericId < 1) {
+    return null;
+  }
+
+  const pool = getMysqlPool();
+  const [rows] = await pool.execute<ConversationRow[]>(
+    `SELECT id, project_id, role, content, intent_action, intent_reason, intent_payload, created_at
+     FROM video_agent_chat_messages
+     WHERE id = :id
+     LIMIT 1`,
+    { id: numericId },
+  );
+
+  return rows[0] ? mapConversationRow(rows[0]) : null;
 }
 
 export async function listMessages(projectId: string) {

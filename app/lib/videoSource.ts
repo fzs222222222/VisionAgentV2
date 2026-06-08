@@ -8,6 +8,14 @@ export type SceneImageSource = {
   createdAt: string;
 };
 
+export type SceneHtmlSource = {
+  sceneNumber: number;
+  title: string;
+  prompt: string;
+  html: string;
+  createdAt: string;
+};
+
 export type SceneAudioSource = {
   sceneNumber: number;
   title: string;
@@ -27,6 +35,15 @@ export type SlideshowVideoSource = {
   updatedAt: string;
 };
 
+export type HtmlVideoSource = {
+  kind: "html_animation";
+  scenes: SceneHtmlSource[];
+  audios: SceneAudioSource[];
+  updatedAt: string;
+};
+
+export type VideoSource = SlideshowVideoSource | HtmlVideoSource;
+
 function isSceneImageSource(value: unknown): value is SceneImageSource {
   if (!value || typeof value !== "object") {
     return false;
@@ -42,6 +59,23 @@ function isSceneImageSource(value: unknown): value is SceneImageSource {
     typeof record.filename === "string" &&
     typeof record.relativePath === "string" &&
     typeof record.publicUrl === "string" &&
+    typeof record.createdAt === "string"
+  );
+}
+
+function isSceneHtmlSource(value: unknown): value is SceneHtmlSource {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+
+  const record = value as Record<string, unknown>;
+  return (
+    typeof record.sceneNumber === "number" &&
+    Number.isInteger(record.sceneNumber) &&
+    record.sceneNumber > 0 &&
+    typeof record.title === "string" &&
+    typeof record.prompt === "string" &&
+    typeof record.html === "string" &&
     typeof record.createdAt === "string"
   );
 }
@@ -69,34 +103,42 @@ function isSceneAudioSource(value: unknown): value is SceneAudioSource {
   );
 }
 
-export function parseVideoSource(content: string) {
+function sortBySceneNumber<T extends { sceneNumber: number }>(items: T[]) {
+  return items.sort((left, right) => left.sceneNumber - right.sceneNumber);
+}
+
+export function parseVideoSource(content: string): VideoSource | null {
   if (!content) {
     return null;
   }
 
   try {
-    const parsed = JSON.parse(content) as SlideshowVideoSource;
-    if (parsed?.kind !== "image_slideshow" || !Array.isArray(parsed.images) || typeof parsed.updatedAt !== "string") {
-      return null;
+    const parsed = JSON.parse(content) as Record<string, unknown>;
+    if (parsed?.kind === "image_slideshow" && Array.isArray(parsed.images) && typeof parsed.updatedAt === "string") {
+      return {
+        kind: "image_slideshow",
+        images: sortBySceneNumber(parsed.images.filter(isSceneImageSource)),
+        audios: sortBySceneNumber((Array.isArray(parsed.audios) ? parsed.audios : []).filter(isSceneAudioSource)),
+        updatedAt: parsed.updatedAt,
+      };
     }
 
-    const images = parsed.images.filter(isSceneImageSource).sort((left, right) => left.sceneNumber - right.sceneNumber);
-    const audios = (Array.isArray(parsed.audios) ? parsed.audios : [])
-      .filter(isSceneAudioSource)
-      .sort((left, right) => left.sceneNumber - right.sceneNumber);
+    if (parsed?.kind === "html_animation" && Array.isArray(parsed.scenes) && typeof parsed.updatedAt === "string") {
+      return {
+        kind: "html_animation",
+        scenes: sortBySceneNumber(parsed.scenes.filter(isSceneHtmlSource)),
+        audios: sortBySceneNumber((Array.isArray(parsed.audios) ? parsed.audios : []).filter(isSceneAudioSource)),
+        updatedAt: parsed.updatedAt,
+      };
+    }
 
-    return {
-      kind: "image_slideshow" as const,
-      images,
-      audios,
-      updatedAt: parsed.updatedAt,
-    };
+    return null;
   } catch {
     return null;
   }
 }
 
-export function createEmptyVideoSource(): SlideshowVideoSource {
+export function createEmptySlideshowVideoSource(): SlideshowVideoSource {
   return {
     kind: "image_slideshow",
     images: [],
@@ -105,9 +147,25 @@ export function createEmptyVideoSource(): SlideshowVideoSource {
   };
 }
 
+export function createEmptyHtmlVideoSource(): HtmlVideoSource {
+  return {
+    kind: "html_animation",
+    scenes: [],
+    audios: [],
+    updatedAt: new Date().toISOString(),
+  };
+}
+
 export function getSceneImageMap(content: string) {
   const parsed = parseVideoSource(content);
-  return Object.fromEntries((parsed?.images ?? []).map((item) => [item.sceneNumber, item])) as Record<number, SceneImageSource>;
+  const images = parsed?.kind === "image_slideshow" ? parsed.images : [];
+  return Object.fromEntries(images.map((item) => [item.sceneNumber, item])) as Record<number, SceneImageSource>;
+}
+
+export function getSceneHtmlMap(content: string) {
+  const parsed = parseVideoSource(content);
+  const scenes = parsed?.kind === "html_animation" ? parsed.scenes : [];
+  return Object.fromEntries(scenes.map((item) => [item.sceneNumber, item])) as Record<number, SceneHtmlSource>;
 }
 
 export function getSceneAudioMap(content: string) {
@@ -116,31 +174,93 @@ export function getSceneAudioMap(content: string) {
 }
 
 export function upsertSceneImageSource(content: string, nextImage: SceneImageSource) {
-  const current = parseVideoSource(content) ?? createEmptyVideoSource();
-  const images = current.images
-    .filter((item) => item.sceneNumber !== nextImage.sceneNumber)
-    .concat(nextImage)
-    .sort((left, right) => left.sceneNumber - right.sceneNumber);
+  const current = parseVideoSource(content);
+  const base = current?.kind === "image_slideshow" ? current : createEmptySlideshowVideoSource();
+  const images = sortBySceneNumber(base.images.filter((item) => item.sceneNumber !== nextImage.sceneNumber).concat(nextImage));
 
   return JSON.stringify({
     kind: "image_slideshow",
     images,
-    audios: current.audios,
+    audios: base.audios,
     updatedAt: new Date().toISOString(),
-  });
+  } satisfies SlideshowVideoSource);
+}
+
+export function upsertSceneHtmlSource(content: string, nextScene: SceneHtmlSource) {
+  const current = parseVideoSource(content);
+  const base = current?.kind === "html_animation" ? current : createEmptyHtmlVideoSource();
+  const scenes = sortBySceneNumber(base.scenes.filter((item) => item.sceneNumber !== nextScene.sceneNumber).concat(nextScene));
+
+  return JSON.stringify({
+    kind: "html_animation",
+    scenes,
+    audios: base.audios,
+    updatedAt: new Date().toISOString(),
+  } satisfies HtmlVideoSource);
 }
 
 export function upsertSceneAudioSource(content: string, nextAudio: SceneAudioSource) {
-  const current = parseVideoSource(content) ?? createEmptyVideoSource();
-  const audios = current.audios
-    .filter((item) => item.sceneNumber !== nextAudio.sceneNumber)
-    .concat(nextAudio)
-    .sort((left, right) => left.sceneNumber - right.sceneNumber);
+  const current = parseVideoSource(content);
+
+  if (current?.kind === "html_animation") {
+    const audios = sortBySceneNumber(current.audios.filter((item) => item.sceneNumber !== nextAudio.sceneNumber).concat(nextAudio));
+
+    return JSON.stringify({
+      kind: "html_animation",
+      scenes: current.scenes,
+      audios,
+      updatedAt: new Date().toISOString(),
+    } satisfies HtmlVideoSource);
+  }
+
+  const base = current?.kind === "image_slideshow" ? current : createEmptySlideshowVideoSource();
+  const audios = sortBySceneNumber(base.audios.filter((item) => item.sceneNumber !== nextAudio.sceneNumber).concat(nextAudio));
 
   return JSON.stringify({
     kind: "image_slideshow",
-    images: current.images,
+    images: base.images,
     audios,
     updatedAt: new Date().toISOString(),
-  });
+  } satisfies SlideshowVideoSource);
+}
+
+export function shiftSceneNumbersAfterInsertion(content: string, insertAfterScene: number) {
+  const current = parseVideoSource(content);
+  if (!current) {
+    return content;
+  }
+
+  const nextSceneNumber = insertAfterScene + 1;
+
+  if (current.kind === "html_animation") {
+    return JSON.stringify({
+      kind: "html_animation",
+      scenes: sortBySceneNumber(
+        current.scenes.map((item) =>
+          item.sceneNumber >= nextSceneNumber ? { ...item, sceneNumber: item.sceneNumber + 1 } : item,
+        ),
+      ),
+      audios: sortBySceneNumber(
+        current.audios.map((item) =>
+          item.sceneNumber >= nextSceneNumber ? { ...item, sceneNumber: item.sceneNumber + 1 } : item,
+        ),
+      ),
+      updatedAt: new Date().toISOString(),
+    } satisfies HtmlVideoSource);
+  }
+
+  return JSON.stringify({
+    kind: "image_slideshow",
+    images: sortBySceneNumber(
+      current.images.map((item) =>
+        item.sceneNumber >= nextSceneNumber ? { ...item, sceneNumber: item.sceneNumber + 1 } : item,
+      ),
+    ),
+    audios: sortBySceneNumber(
+      current.audios.map((item) =>
+        item.sceneNumber >= nextSceneNumber ? { ...item, sceneNumber: item.sceneNumber + 1 } : item,
+      ),
+    ),
+    updatedAt: new Date().toISOString(),
+  } satisfies SlideshowVideoSource);
 }
